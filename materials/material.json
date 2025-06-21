@@ -1,0 +1,11 @@
+{
+  "material_name": "stealth_fog_ram",
+  "density_kg_per_m3": 1850,
+  "radar_absorption_db": 23.7,
+  "effective_range_m": 2.8,
+  "particle_size_microns": 4.2,
+  "spray_dispersal_rate_g_per_s": 60,
+  "settling_time_seconds": 90,
+  "environmental_decay_factor": 0.12,
+  "color": "matte_black"
+}
