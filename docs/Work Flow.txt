@@ -1,0 +1,14 @@
+# Drone Swarm Simulation Development Workflow
+
+## Project Goal
+To develop a 3D drone swarm simulation capable of:
+1.  Forming specific patterns (rectangular, staggered).
+2.  Navigating from arbitrary initial positions.
+3.  Hovering stably around target positions.
+4.  Avoiding collisions.
+5.  Operating under realistic, variable wind conditions.
+6.  Being structured for future AI/ML model training.
+7.  Visualizing the entire simulation trajectory.
+8.  Counting collisions.
+
+---

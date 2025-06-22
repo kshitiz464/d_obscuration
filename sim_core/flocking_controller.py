@@ -511,23 +511,28 @@
 Implements a Boids-inspired flocking algorithm with sensor-fusion and relative ranging for tight formations.
 Now properly manages individual drone fused position history.
 Includes dynamic target attraction for smoother and more robust hovering, addressing drift.
+The 'max_force' parameter is now interpreted as the maximum *force* (in Newtons) the controller can output.
+Enhanced damping and target pull logic for improved hover stability.
+Added explicit proportional and DERIVATIVE vertical control for stable altitude holding.
 """
 import math
 from typing import List, Tuple, Optional
-from sensor_utils import get_corrected_position, fuse_gps_imu, get_range
+from .sensor_utils import get_corrected_position, fuse_gps_imu, get_range 
 
 class FlockingController:
     def __init__(self,
                  perception_radius: float = 5.0,
                  max_speed: float = 2.0,
-                 max_force: float = 0.05,
+                 max_force: float = 0.05, # Now interpreted as Newtons
                  weight_sep: float = 2.0,
                  weight_align: float = 1.0,
                  weight_cohesion: float = 1.0,
                  weight_target: float = 0.5,
                  kp_target: float = 0.1,
                  nominal_spacing: float = 5.0,
-                 hover_slowing_radius: float = 5.0 # New parameter for dynamic target attraction
+                 hover_slowing_radius: float = 5.0,
+                 vertical_hover_kp: float = 0.5, # Proportional gain for vertical hover stability (N/m)
+                 vertical_hover_kd: float = 0.1 # NEW: Derivative gain for vertical hover stability (N/(m/s))
                 ):
         self.perception_radius = perception_radius
         self.max_speed = max_speed
@@ -539,6 +544,8 @@ class FlockingController:
         self.kp_target = kp_target
         self.nominal_spacing = nominal_spacing
         self.hover_slowing_radius = hover_slowing_radius
+        self.vertical_hover_kp = vertical_hover_kp 
+        self.vertical_hover_kd = vertical_hover_kd # Store new derivative parameter
 
         # Initialize a list to store the previously fused position for each drone
         self.prev_fused_positions: List[Tuple[float, float, float]] = []
@@ -551,12 +558,8 @@ class FlockingController:
                 use_fusion: bool = True
                ) -> List[Tuple[float, float, float]]:
         """
-        Compute acceleration vectors using:
-          - Sensor fusion (GPS+IMU) - now correctly managed per drone
-          - Separation (with UWB ranging)
-          - Alignment
-          - Cohesion
-          - Target attraction (dynamically adjusted for hovering)
+        Compute control forces for each drone based on flocking rules and target attraction.
+        The output is now a list of (fx, fy, fz) tuples, representing forces in Newtons.
         """
         n = len(raw_positions)
 
@@ -579,7 +582,7 @@ class FlockingController:
         # Use the newly computed current_fused_positions for flocking calculations
         positions = current_fused_positions
 
-        accelerations: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * n
+        control_forces: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * n
         # Define a small epsilon to prevent division by zero for distances
         EPSILON = 1e-6 
 
@@ -621,8 +624,9 @@ class FlockingController:
                     coh[2] += positions[j][2]
                     total += 1
             
-            # aggregate forces
-            ax = ay = az = 0.0
+            # aggregate forces (scaled by max_force which is now Newtons)
+            # These are proportional contributions scaled to max_force
+            fx_control = fy_control = fz_control = 0.0
             if total > 0:
                 # finalize alignment
                 align = [c/total for c in align]
@@ -639,93 +643,88 @@ class FlockingController:
                 sep = [c/mag * self.max_force for c in sep]
                 
                 # weighted sum of flocking forces
-                ax = self.weight_sep * sep[0] + self.weight_align * align[0] + self.weight_cohesion * coh[0]
-                ay = self.weight_sep * sep[1] + self.weight_align * align[1] + self.weight_cohesion * coh[1]
-                az = self.weight_sep * sep[2] + self.weight_align * align[2] + self.weight_cohesion * coh[2]
+                fx_control = self.weight_sep * sep[0] + self.weight_align * align[0] + self.weight_cohesion * coh[0]
+                fy_control = self.weight_sep * sep[1] + self.weight_align * align[1] + self.weight_cohesion * coh[1]
+                fz_control = self.weight_sep * sep[2] + self.weight_align * align[2] + self.weight_cohesion * coh[2]
             
             # target attraction (steering towards target velocity)
             if targets:
                 tx, ty, tz = targets[i]
                 dx = tx - pos_i[0]
                 dy = ty - pos_i[1]
-                dz = tz - pos_i[2]
+                dz = tz - pos_i[2] # Vertical distance to target
                 dist = math.sqrt(dx*dx + dy*dy + dz*dz)
                 
                 if dist > EPSILON: # Use EPSILON here
                     effective_kp_target = self.kp_target
-                    min_kp_factor_val = 0.05 # Minimum kp_target factor when very close
+                    min_kp_factor_val = 0.005 # Minimal kp_target factor when very close
                     
-                    # Ensure hover_slowing_radius is always greater than nominal_spacing for a valid slowing zone
-                    # If they are too close, slightly adjust hover_slowing_radius
-                    # Adding a safety margin to nominal_spacing for the calculation
                     slowing_zone_start = self.hover_slowing_radius
-                    slowing_zone_end = self.nominal_spacing # Target attraction very low once inside this
+                    slowing_zone_end = self.nominal_spacing * 0.75 # Softer transition
                     
-                    # To prevent division by zero and ensure a valid range
                     slowing_zone_diff = slowing_zone_start - slowing_zone_end
-                    if slowing_zone_diff < 1.0: # Ensure a minimum difference of 1 meter
-                        slowing_zone_diff = 1.0
-                        slowing_zone_start = slowing_zone_end + 1.0 # Adjust start if too small
+                    if slowing_zone_diff < 0.1: # Ensure a minimum non-zero difference for smoothing
+                        slowing_zone_diff = 0.1
+                        slowing_zone_start = slowing_zone_end + 0.1 
                     
                     if dist <= slowing_zone_end:
-                        # Very close to nominal spacing, apply minimum attraction
                         effective_kp_target = self.kp_target * min_kp_factor_val
                     elif dist < slowing_zone_start:
-                        # Inside the slowing zone, gradually reduce attraction
-                        # Scale from (1.0 at slowing_zone_start) down to (min_kp_factor_val at slowing_zone_end)
                         scale_progress = (dist - slowing_zone_end) / slowing_zone_diff
                         scale_progress = max(0.0, min(1.0, scale_progress)) # Clamp to [0, 1]
                         
                         effective_kp_target = self.kp_target * (min_kp_factor_val + (1.0 - min_kp_factor_val) * scale_progress)
                     # Else (dist >= slowing_zone_start), effective_kp_target remains self.kp_target (full strength)
 
-
                     # Add damping to prevent overshooting and oscillations when near target
-                    # Damping strength increases significantly as drone approaches target
                     damping_coeff = 0.0
-                    damping_active_radius = max(self.hover_slowing_radius * 2.0, 30.0) # Active damping over a larger radius
+                    damping_active_radius = max(self.hover_slowing_radius * 2.0, 30.0)
                     
                     if dist < damping_active_radius: 
-                        # Scale damping from 0 (at damping_active_radius) to max_damping_coeff (at target)
-                        max_damping_coeff = 10.0 # Increased max damping strength for better stability
+                        max_damping_coeff = 35.0 # Increased max damping strength (was 30.0)
                         
-                        # Calculate a scaling factor: closer = higher damping
-                        # Ensure denominator is not zero or too small
                         damping_range = damping_active_radius - self.nominal_spacing
-                        if damping_range < 0.1: damping_range = 0.1 # Safety check
+                        if damping_range < 0.1: damping_range = 0.1 
                         
                         damping_scale = 1.0 - (dist - self.nominal_spacing) / damping_range
-                        damping_scale = max(0.0, min(1.0, damping_scale)) # Clamp to [0, 1]
+                        damping_scale = max(0.0, min(1.0, damping_scale))
                         
                         damping_coeff = max_damping_coeff * damping_scale
                         
-                        ax -= v_i[0] * damping_coeff
-                        ay -= v_i[1] * damping_coeff
-                        az -= v_i[2] * damping_coeff
+                        fx_control -= v_i[0] * damping_coeff 
+                        fy_control -= v_i[1] * damping_coeff
+                        fz_control -= v_i[2] * damping_coeff
                     
-                    # Ensure a minimal target pull even when very close to counteract sensor noise/drift
-                    # This is applied *after* damping calculation to ensure stability
-                    min_pull_strength = self.max_force * 0.01 # A very small constant pull
-                    if effective_kp_target < min_pull_strength:
-                        effective_kp_target = min_pull_strength
+                    # NEW: Proportional and DERIVATIVE vertical control for hover stability
+                    # Apply these when drone is within a reasonable vertical range of the target
+                    # This is specifically for fine-tuning altitude.
+                    if abs(dz) < self.hover_slowing_radius * 2.0: # Apply over a larger vertical range for smoother approach
+                        vertical_error = tz - pos_i[2] # Target Z - Current Z
+                        vertical_velocity = v_i[2] # Current vertical velocity (target is 0)
 
-                    desired_vel = [dx/dist * self.max_speed, # Desired velocity towards target
+                        # Proportional component
+                        fz_control += vertical_error * self.vertical_hover_kp
+                        # Derivative component (damping based on vertical velocity)
+                        fz_control -= vertical_velocity * self.vertical_hover_kd # Negative sign to oppose motion
+
+                    # NOTE: Removed min_hover_force as it might conflict with PID
+                        
+                    desired_vel = [dx/dist * self.max_speed,
                                    dy/dist * self.max_speed,
                                    dz/dist * self.max_speed]
                     
-                    # Proportional control on velocity error using effective_kp_target
-                    targ_acc = [effective_kp_target * (desired_vel[k] - v_i[k]) for k in range(3)]
+                    # Proportional control on velocity error using effective_kp_target, scaled by max_force
+                    targ_force = [effective_kp_target * (desired_vel[k] - v_i[k]) * self.max_force for k in range(3)] 
                     
-                    ax += self.weight_target * targ_acc[0]
-                    ay += self.weight_target * targ_acc[1]
-                    az += self.weight_target * targ_acc[2]
+                    fx_control += self.weight_target * targ_force[0]
+                    fy_control += self.weight_target * targ_force[1]
+                    fz_control += self.weight_target * targ_force[2]
             
-            # Limit the total acceleration/force
-            mag = math.sqrt(ax*ax + ay*ay + az*az)
+            # Limit the total control force output by the controller
+            mag = math.sqrt(fx_control**2 + fy_control**2 + fz_control**2)
             if mag > self.max_force:
-                ax, ay, az = [c/mag * self.max_force for c in (ax, ay, az)]
+                fx_control, fy_control, fz_control = [c/mag * self.max_force for c in (fx_control, fy_control, fz_control)]
             
-            accelerations[i] = (ax, ay, az)
+            control_forces[i] = (fx_control, fy_control, fz_control)
         
-        return accelerations
-
+        return control_forces
